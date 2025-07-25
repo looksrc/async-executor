@@ -18,6 +18,12 @@ impl Executor<'static> {
     ///
     /// `StaticExecutor` cannot be converted back into a `Executor`, so this operation is
     /// irreversible without the use of unsafe.
+    /// 
+    /// 消耗[`Executor`]且在函数中将其泄露，并将泄露的state让渡给[`StaticExecutor`]。
+    /// 
+    /// 基本等价于`Box::leak(Box::new(executor))`，但是更易于孵化、执行、完结任务。
+    /// 
+    /// [`StaticExecutor`]不能通过安全的方式转回[`Executor`]。
     ///
     /// # Example
     ///
