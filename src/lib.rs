@@ -880,6 +880,7 @@ impl State {
 /// 概念：
 /// - 工人：获取已就绪任务并执行之的一段常驻程序。
 /// - 工人线程：工人所占据的线程。
+/// - 工人时钟：Ticker，可以看做工人的一部分，负责代理工人的睡眠和找任务等工作。
 /// - 工人状态：
 ///   * 睡眠：Ticker::sleeping == 0。
 ///   * 清醒：Ticker::sleeping > 0，Waker in Sleepers::sleppers，线程暂停。
@@ -898,7 +899,7 @@ impl State {
 ///
 /// 注意：
 /// - 工人的睡眠与线程的暂停并非完全重合的。
-/// - 工人被通知后线程会恢复执行，并尝试获取任务并自我唤醒，(此过程中工人依然是休眠状态)。
+/// - 工人被通知后线程先恢复执行，尝试获取任务并自我清醒，(此过程中工人依然是休眠状态)。
 /// - 工人如果成功获取到了任务，此时才会标记为清醒状态(sleeping=0)，否则工人继续标记为睡眠中。
 ///
 /// 关于count值与wakers.len()：
@@ -909,14 +910,19 @@ impl State {
 /// - 结论：当count != wakers.len() 时，说明此时正有被通知的工人(线程恢复了)尝试获取任务让自己变清醒。
 struct Sleepers {
     /// Number of sleeping tickers (both notified and unnotified).
+    /// 睡眠中的工人数量。即sleeping=0的工人数量。
     count: usize,
 
-    /// IDs and wakers of sleeping unnotified tickers.<br>
+    /// IDs and wakers of sleeping unnotified tickers.
+    ///
+    /// 睡眠中的工人对应的线程恢复器。
     ///
     /// A sleeping ticker is notified when its waker is missing from this list.<br>
     wakers: Vec<(usize, Waker)>,
 
     /// Reclaimed IDs.
+    ///
+    /// 可被复用的睡眠ID列表。
     free_ids: Vec<usize>,
 }
 
@@ -1013,12 +1019,11 @@ impl Sleepers {
 }
 
 /// Runs task one by one.
-/// 工人小助手。
+/// 工人状态小助手。
 ///
 /// 两个职责：
-/// - 根据任务获取逻辑，为工人寻找任务(来执行)。
+/// - 根据任务获取逻辑，为工人获取任务(来执行)。
 /// - 根据任务寻找结果，无任务时让工人进入休眠，有任务时唤醒工人。
-///
 struct Ticker<'a> {
     /// The executor state.
     /// 执行器引用。
@@ -1051,18 +1056,18 @@ impl Ticker<'_> {
     ///
     /// Returns `false` if the ticker was already sleeping and unnotified.
     ///
-    /// 将工人进入休眠状态。
+    /// 将工人进入睡眠状态。
     ///
     /// 原状态如果是：
-    /// - 清醒：将唤醒器插入休眠列表，回写休眠ID。更新休眠计数。
-    /// - 休眠：依据休眠ID，更新或插入唤醒器。不更新休眠计数。
+    /// - 清醒：将线程恢复器插入睡眠管理器Sleepers，回写睡眠ID。更新睡眠计数。
+    /// - 睡眠：依据睡眠ID，更新或插入线程恢复器。不更新睡眠计数。
     ///
     /// 返回值：
     /// - 如果原先不是睡眠状态，或waker不存在，此时返回true。
-    /// - 否则，Ticker已经睡眠状态，且未被通知(waker存在)，则返回false。(完美状态)。
+    /// - 否则，工人已经是睡眠状态，且未被通知(waker存在)，则返回false。
     ///
-    /// 更新搜索器监视器：
-    /// - 更新后，休眠数与唤醒器如果不一致，说明有唤醒器被取出通知了。
+    /// 更新工人自我唤醒互斥锁：
+    /// - 依据当前是否有工人正在进行自我清醒流程，更新互斥锁。
     fn sleep(&mut self, waker: &Waker) -> bool {
         let mut sleepers = self.state.sleepers.lock().unwrap();
 
@@ -1089,11 +1094,11 @@ impl Ticker<'_> {
 
     /// Moves the ticker into woken state.
     ///
-    /// 将工人标记为清醒状态。
+    /// 将工人自我清醒。
     ///
     /// 依据当前状态：
     /// - 清醒：什么都不干。
-    /// - 休眠：从休眠列表中移除唤醒器，并更新对工人的监测状态。
+    /// - 睡眠：从睡眠列表中移除线程恢复器，并更新互斥锁。
     fn wake(&mut self) {
         if self.sleeping != 0 {
             let mut sleepers = self.state.sleepers.lock().unwrap();
@@ -1118,17 +1123,16 @@ impl Ticker<'_> {
     /// 实现方式：
     /// - 将查找逻辑通过poll_fn附加上下文后转为一个Future，等待此Future完成。
     /// - 如果没查到，则将工人转入睡眠状态。如果之前已经是睡眠状态则返回Pending
-    /// - 如果找到了，自身转为唤醒状态，然后唤醒一个其它休眠中的工人，最终返回找到的任务。
+    /// - 如果找到了，自身转为唤醒状态，然后传播唤醒一个其它睡眠中的工人，最终返回找到的任务。
     async fn runnable_with(&mut self, mut search: impl FnMut() -> Option<Runnable>) -> Runnable {
         future::poll_fn(|cx| {
             loop {
                 match search() {
                     None => {
                         // Move to sleeping and unnotified state.
-                        // 将当前工人进入休眠和未通知状态：即sleeping=0，且对应的waker在休眠列表中。
+                        // 工人进入睡眠。
                         //
-                        // 如果Ticker之前已经休眠状态且count与waker一致，则返回false,进入if逻辑。
-                        // 此if返回Pending，表明获取IO任务的协程进入等待状态，线程可以执行其它协程。
+                        // 如果之前已经睡眠状态且count与waker一致，则返回false，让工人线程暂停。
                         if !self.sleep(cx.waker()) {
                             // If already sleeping and unnotified, return.
                             return Poll::Pending;
@@ -1140,6 +1144,7 @@ impl Ticker<'_> {
 
                         // Notify another ticker now to pick up where this ticker left off, just in
                         // case running the task takes a long time.
+                        // 传播唤醒另一个工人，防止当前工人执行太久。
                         self.state.notify();
 
                         return Poll::Ready(r);
@@ -1154,19 +1159,19 @@ impl Ticker<'_> {
 impl Drop for Ticker<'_> {
     fn drop(&mut self) {
         // If this ticker is in sleeping state, it must be removed from the sleepers list.
-        // 如果当前任务搜索器还处于休眠状态，则先从休眠列表中移除
+        // 如果当前工人还处于睡眠状态，则先从睡眠列表中移除线程恢复器。
         if self.sleeping != 0 {
-            // 从休眠列表移除。
+            // 移除线程恢复器。
             let mut sleepers = self.state.sleepers.lock().unwrap();
             let notified = sleepers.remove(self.sleeping);
 
-            // 根据最新休眠列表刷新对任务搜索器的监测状态。
+            // 刷新工人清醒互斥锁。
             self.state
                 .notified
                 .store(sleepers.is_notified(), Ordering::Release);
 
             // If this ticker was notified, then notify another ticker.
-            // 如果对任务搜索器的监测状态为需要唤醒，则先遗弃休眠列表守卫，再执行唤醒。
+            // 如果当前有工人正在进行清醒流程中，则先遗弃线程恢复器列表，再通知一次。
             if notified {
                 drop(sleepers);
                 self.state.notify();
@@ -1176,20 +1181,17 @@ impl Drop for Ticker<'_> {
 }
 
 /// A worker in a work-stealing executor.
-/// 任务窃取执行器中的工人。
+/// 工人，用在任务窃取型执行器中。
 ///
 /// This is just a ticker that also has an associated local queue for improved cache locality.
-///
-/// 这是一个任务搜索器的进化版：
-/// - Ticker负责拉取任务和管理守护进程的休眠。且提供给runnable_with的拉取任务逻辑是从全局队列。
-/// - Runner嵌入了Ticker，覆盖了Ticker的runnable方法，调用Ticker::runnable_with提供任务窃取逻辑。
 struct Runner<'a> {
     /// The executor state.
     ///
-    /// 执行器引用。
+    /// 执行器状态数据引用。
     state: &'a State,
 
     /// Inner ticker.
+    /// 工人小工具。
     ticker: Ticker<'a>,
 
     /// The local queue.
